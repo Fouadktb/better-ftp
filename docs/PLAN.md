@@ -1,103 +1,82 @@
 # Better FTP delivery plan
 
-Better FTP is a desktop file transfer client for Windows, macOS, and Linux. Its first release should make connecting, browsing, and transferring files understandable and dependable. Later phases add protocol coverage and advanced automation without compromising that workflow.
+The first milestone is a useful native file-transfer client with explicit protocol support and trustworthy operational state. It is an alpha for testing; later phases close the remaining daily-use and distribution gaps.
 
 ## Architecture
 
-- **Desktop shell:** Tauri 2, with platform integration and privileged operations in Rust.
-- **Interface:** React, TypeScript, and Vite. A dual-pane workspace presents local and remote directories, connection profiles, and a visible session transfer queue (durable persistence arrives in phase 3).
-- **Rust backend:** owns local filesystem access, FTP/explicit FTPS sessions, directory listings, and transfers. Passwords remain in session memory for phase 1 and are excluded from saved profiles and application logs.
-- **Frontend boundary:** typed commands and results isolate desktop operations from UI state. The production adapter uses native commands exclusively. A browser without the native runtime shows an unavailable state; it does not supply files, a connection, or simulated transfer success. Test fixtures are injected by the test harness and excluded from the production adapter.
-- **Frontend structure:** separate connection, directory, profile, and transfer lifecycle hooks from native services and presentation. Shared button, input, dialog, and table primitives provide consistent interaction. Follow the compact utility-first interaction patterns of T3 Code and shadcn: file content, connection controls, and transfer state take precedence over decorative headings or promotional copy. Session/navigation/queue state now lives in a React-independent controller with deterministic deferred-response tests.
-- **Transfer model:** a serial queue in phase 1, with explicit queued, active, completed, failed, and cancelled states as supported by the implementation. Capabilities are exposed honestly; a control must not promise an operation the backend cannot perform.
-- **Delivery model:** each phase ends with an executable, reviewable milestone and a recorded verification result. A scaffold or passing frontend build alone does not establish native or protocol correctness.
+- Tauri 2 desktop shell, React/TypeScript interface, Vite build.
+- Privileged filesystem and protocol operations live in Rust. `RemoteClient` separates FTP/FTPS and SSH/SFTP from the streaming transfer engine.
+- A React-independent controller owns connection identity, directory request revisions, saved profiles, and serial queue transitions. Transfer completion cannot override newer navigation; late responses cannot replace a newer session.
+- Production uses native commands exclusively. Browser tests inject fixtures at the harness boundary; the product contains no sample filesystem or simulated transfer mode.
+- Profiles contain whitelisted metadata. Passwords, passphrases and private-key contents are not persisted. Actual SSH handshake verification precedes authentication; certificate/host-key bypasses are unsupported.
+- A measured-byte rate meter supplies rolling live throughput and completed averages. Cancellation interrupts network sockets and discards uncertain sessions.
+- `package.json` is the version source; the version script synchronizes Cargo, Tauri and lockfile versions. Installer CI creates draft prereleases only.
 
-## Phase 1 — Working foundation
+## Milestone 1 — 0.1.0-alpha.1
 
-**Status: revised alpha implemented and locally verified on macOS; platform and remaining protocol gates are open.**
+**Status: implemented and locally verified on macOS; GitHub platform checks and installer validation are separate release gates.**
 
-Deliver a useful end-to-end desktop slice: real local browsing, real FTP and explicit FTPS browsing and file transfers, dual panes, saved connection metadata, and a serial transfer queue. Ship only real native operations. Keep deterministic test fixtures in the test harness, with no product demo mode or sample server.
+Delivered:
 
-Acceptance criteria:
+- Local/remote panes, path/history navigation, refresh, filtering, sorting, hidden files, multiselection, keyboard controls, resizable layout and docked queue/log.
+- FTP, explicit FTPS, and SFTP single-file listing/upload/download.
+- SFTP password, encrypted private-key and SSH-agent authentication. Unknown SSH keys require SHA256 fingerprint confirmation. Changed keys are blocked. Known-host writes are atomic and locked; no global SSH files are modified.
+- Connection settings for protocol-specific default ports, authentication, native key/folder selection, default local/remote directories and actual network timeout.
+- Legacy FTP/FTPS profile migration with unchanged protocol semantics and credential-free persistence.
+- Serial queue, measured progress/live speed, completed averages, pause, retry, active/waiting cancellation and session recovery metadata.
+- SFTP exclusive-create uploads; atomic no-clobber local downloads; explicit FTP listing-then-STOR collision limitation.
+- Unsaved-form discard guard, focus preservation, and native transfer-aware window close/macOS application-menu Quit.
+- Dedicated desktop icon, MIT license, public repository, synchronized alpha version, contributor/release documentation and cross-platform artifact workflow.
 
-- Local and remote panes have independent paths, parent navigation, refresh, sorting, filtering, selection, loading, empty, and error states.
-- Users can create, edit, select, and delete connection profiles. Profiles record the protocol, host, port, username, and name; saved data contains no password.
-- A connection shows server identity, chosen protocol, connecting/connected/error states, and an explicit disconnect action. Plain FTP visibly identifies its unencrypted transport.
-- Desktop FTP and explicit FTPS can list directories and transfer an individual file in either direction. FTPS validates the server certificate; certificate failures are surfaced, not silently bypassed.
-- Transfers run serially and show direction, filename, status, progress when available, and actionable errors. An unsuccessful operation cannot appear completed. Known conflicts are refused. Local downloads guarantee no-clobber persistence; FTP upload listing-then-STOR has a cross-client race that must be resolved before claiming atomic no-overwrite behavior.
-- Long operations do not freeze the workspace. Passwords do not appear in logs, persisted profiles, queue entries, or error messages.
-- Connection and directory state have explicit lifecycle identities. Disconnect, reconnect, unmount, and newer navigation invalidate stale async results. A transfer completion cannot navigate the user back to an earlier directory.
-- Queue transitions have one owner. Starting a file, cancelling a waiting file, pausing, retrying, and completing a file are tested against concurrent UI events. Transfers belong to a specific connection session and cannot run against a replacement session.
-- Enqueue validates both source and destination availability. Busy or failed directory views cannot silently become transfer destinations. The app documents and tests what happens when its window closes during an active transfer.
-- Keyboard access, visible focus, labeled icon controls, accessible dialogs, readable contrast, and usable narrow-window behavior are part of the slice.
+Local verification:
 
-Verification and release gate:
+- 52 model/controller/throughput/profile tests.
+- 24 desktop/mobile Playwright scenarios, including native-runtime absence, transfers/conflicts/cancellation, light/dark layout, resize and keyboard controls, guarded dismissal, protocol/default/custom ports, key/folder selection, saved settings, first-use trust and changed-key blocking.
+- Three version-sync fixture regressions and real-tree consistency check.
+- 13 Rust tests with actual authenticated loopback SSH/SFTP and FTP/FTPS fault fixtures: password, encrypted Ed25519 key and isolated SSH-agent auth, unknown/changed host keys, fingerprint revalidation, canonical directories, binary roundtrips, exclusive/no-clobber behavior, byte progress, cancellation/reconnect, dropped connections and untrusted FTPS rejection.
+- Production frontend build, Rust formatting and Clippy with warnings denied, and macOS application bundling.
+- Packaged native UI: actual FTP and SFTP connect/list/upload/download, byte-for-byte file integrity, first-use SHA256 comparison against the test server, guarded exit and unsaved-form confirmation. Native UI tests use disposable loopback fixtures.
 
-- Frontend type checking and production build pass. Meaningful unit tests cover path handling, profile persistence without credentials, queue state transitions, and failures.
-- Rust formatting, compilation, linting, and relevant tests pass in an environment with the Rust toolchain and required Tauri platform dependencies.
-- Integration checks use disposable FTP and explicit FTPS servers: connect, list, upload, download, binary integrity, invalid credentials, invalid certificate, missing paths, permission errors, disconnect, and transfer failure.
-- A native smoke test exercises the real filesystem and protocol boundary. Browser interaction tests inject native-command fixtures before app startup; they test the same production UI without adding a runtime test/demo selector. An unmocked browser check verifies that native operations remain unavailable.
-- Deferred-response tests cover disconnect during listing, connection replacement, rapid navigation, transfer completion during navigation, pause/start/cancel transitions, unmount, and stale-session rejection.
-- Record unavailable checks and known limitations. Do not mark phase 1 complete until its native and protocol gates have actually passed.
+Remaining release gates:
 
-## Phase 2 — Secure connections and everyday transfers
+- Execute Windows/Linux and Intel/ARM macOS artifact builds and test installation, launch, transfers and uninstall on those targets.
+- Positive FTPS transfer against a trusted certificate, denied-permission fixtures, formal accessibility review and large-directory/queue performance budgets.
+- Review third-party license notices and signing/notarization before public distribution. Alpha artifacts remain unsigned on Windows/Linux and ad-hoc signed on macOS.
+- Dock Quit, forced termination and OS shutdown remain outside the verified close guard.
 
-Add SFTP, operating-system credential storage, SSH host-key verification, recursive folder transfers, bounded concurrency, and explicit overwrite/skip/rename conflict handling. Preserve directory context across reconnects.
+## Milestone 2 — Daily file operations
 
-Acceptance and testing gate:
+Add recursive folder transfers, mkdir/rename/delete, conflict decisions (skip, rename and explicit replace), bookmarks and drag/drop. Add keyboard-interactive/MFA and host-key replacement management after designing explicit trust transitions.
 
-- SFTP distinguishes first-use and changed host keys; changed keys cannot be accepted silently. Password and key authentication follow explicit user choices.
-- Credentials are stored through an appropriate platform credential service, excluded from profile exports, and removable by the user.
-- Folder traversal defines symlink and permission behavior and prevents destination path escape. Cancelling work stops ongoing operations and leaves queue state accurate.
-- Protocol integration tests cover nested directories, Unicode and spaces, zero-byte and large files, denied access, partial failures, conflicts, and cancellation. Each supported platform validates credential storage and native interaction.
+Acceptance:
 
-## Phase 3 — Recovery and transfer reliability
+- Traversal defines symlink and permission behavior and prevents destination path escape.
+- Destructive actions are deliberate, reviewable and accurately logged. Existing-file decisions show source/destination metadata.
+- Tests cover nesting, Unicode, case sensitivity, empty/large files, denied access, partial failure and cancellation.
+- SSH config/proxy/ProxyJump support is a separately scoped connection feature; do not expose nonfunctional settings.
 
-Add persistent queues, reconnect and retry policies, safe resume where the server and protocol support it, bandwidth and concurrency controls, and diagnostics that redact secrets.
+## Milestone 3 — Transfer reliability and performance
 
-Acceptance and testing gate:
+Add a bounded transfer pool with a separate browsing connection, per-server budgets, reconnect/retry policy, durable queues, resume where safe, and speed limits. Add OS credential storage as an explicit user choice.
 
-- Restarting the app preserves eligible queued work without silently resuming a destructive operation or persisting credentials in the queue.
-- Resume validates the existing destination and falls back to an explicit user decision when safe continuation cannot be established.
-- Interrupted networks, server restarts, app restarts, disk exhaustion, and partial destination files have tested recovery behavior. Completed-file integrity is verified in the test suite.
-- Stress tests cover large directories and long queues; performance budgets are measured and documented before release.
+Acceptance:
 
-## Phase 4 — Advanced file workflows
+- Transfers remain bound to their intended endpoint through reconnect/restart, with fresh authentication and no secrets in queue records.
+- Retry does not loop authentication failures or silently replace partial/existing destinations.
+- Resume validates the existing data and requires a decision if safe continuation cannot be established.
+- Interrupted networks, server/app restarts, disk exhaustion, worker cancellation and large directories have measured behavior and deterministic tests.
+- Credentials can be removed from the platform store and are excluded from exports/logs.
 
-Add directory comparison and synchronization, synchronized browsing, bookmarks, remote editing, and configurable transfer rules. Scheduling and unattended automation require a separate design and explicit user control.
+## Milestone 4 — Advanced workflows
 
-Acceptance and testing gate:
+Directory comparison/synchronization, synchronized navigation, remote editing and transfer rules follow a reviewed design.
 
-- Sync starts with a reviewable plan listing uploads, downloads, conflicts, and deletions. Destructive changes require a deliberate action.
-- Comparisons document timestamp, size, and checksum assumptions. Dry-run and execution agree on a controlled test fixture.
-- Remote editing identifies external changes and obtains an explicit decision before replacing conflicting content.
-- Tests cover timestamp precision, time zones, case sensitivity, symlinks, changed remote files, and partial sync failures.
+Acceptance:
 
-## Phase 5 — Distribution and stable release
+- Sync offers a dry-run plan with uploads, downloads, conflicts and deletions before execution.
+- Timestamp/checksum assumptions are documented; conflict handling protects externally modified files.
+- Tests cover time zones, timestamp precision, case sensitivity, symlinks and partial execution.
 
-Produce installable, signed releases for Windows, macOS, and Linux, with documented prerequisites, upgrade behavior, release notes, and a supported-platform matrix.
+## Distribution and stable release
 
-Acceptance and release gate:
-
-- CI builds and tests the native app on every supported operating system. Installation, launch, connection, transfer, upgrade, and uninstall are smoke-tested using packaged artifacts.
-- macOS signing/notarization, Windows signing, and selected Linux package formats are verified before public distribution. Release credentials remain outside the repository.
-- An update mechanism, if enabled, validates signed updates and has tested failure behavior.
-- Accessibility and keyboard review, credential and logging review, crash recovery, dependency license checks, and protocol compatibility checks have recorded outcomes.
-- Publish only capabilities that passed the release gates, with known limitations and recovery instructions included in the release notes.
-
-## Working approach
-
-The primary agent owns integration and the acceptance gates. Parallel sub-agents take bounded architecture, backend, frontend, or review tasks with explicit file ownership. Findings are reconciled before a milestone is declared complete. Changes stay independently reviewable; a later phase does not conceal unresolved correctness failures from an earlier one.
-
-## Verification record — 2026-11-16
-
-Passed on macOS after the production refactor:
-
-- TypeScript and production frontend build; exact tested JavaScript dependency versions and lockfile included in the source tree.
-- 47 model/controller and throughput tests covering Windows roots, directory filtering/sorting, session replacement, late directory responses, completion during navigation, transfer eligibility, serial execution, pause/cancel, stale cancellation responses, measured completion bytes, relative remote paths, recovery fencing, close waiting, credential-free profile persistence, rolling throughput, and stalled-transfer rate decay.
-- 18 Playwright scenarios across desktop/mobile, including an unmocked unavailable-runtime check. Native fixtures are injected only by the harness. The scenarios cover real product controls, both transfer directions, conflicts, cancellation/disconnection, light/dark themes, resizing, keyboard-operated tabs, real-time rate display, guarded connection dismissal, unchanged/reverted form detection, and protection during pending connections.
-- Eight Rust tests including actual loopback FTP binary roundtrip, Unicode names, no-clobber checks, invalid credentials, measured progress, session metadata and canonical paths, cancellation/reconnect, dropped-server cleanup, and untrusted FTPS certificate rejection.
-- Rust formatting and Clippy with warnings denied.
-- macOS release application package built. Native UI connected to a disposable loopback FTP server, uploaded and downloaded files; file contents matched at both ends. A throttled transfer displayed actual progress and Cmd+Q opened the transfer-confirmation dialog. Keeping the app open preserved the transfer; cancellation closed the connection and the corrected cancel-and-close path exited the app. The rebuilt native dialog also warned on outside click, preserved values with Keep editing, and discarded only after confirmation. Temporary test connection profiles were removed afterward.
-
-Remaining release gates: positive FTPS transfer with a trusted certificate, denied-permission fixtures, formal accessibility review, large-directory performance, and Windows/Linux execution of the configured CI matrix. Dock Quit, forced termination, and operating-system shutdown are outside the verified close-guard scope. FTP upload listing-then-STOR still has a cross-client collision race; atomic remote no-overwrite is not claimed. SFTP, recursive transfers, durable queues, resume, signed releases, and license selection remain on the roadmap.
+Every milestone produces a versioned, reviewable build. Stable release requires recorded platform smoke tests, signed/notarized installers as appropriate, dependency/license and accessibility review, and demonstrated recovery behavior. An updater is a separate signed-update design. The [FileZilla comparison](FILEZILLA_COMPARISON.md) tracks capability gaps; the [release guide](RELEASING.md) defines version, artifact and publication procedures.

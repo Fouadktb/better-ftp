@@ -53,6 +53,13 @@ jobs:
       - name: Select stable Rust
         run: rustup update stable --no-self-update
       - run: rustup default stable
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          workspaces: src-tauri -> target
+          key: checks-${{ matrix.os }}
+          cache-bin: false
+          save-if: ${{ github.event_name != 'pull_request' }}
       - run: npm ci
       # Tauri's generated context embeds the frontend production assets.
       - run: npm run build

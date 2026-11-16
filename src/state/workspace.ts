@@ -225,7 +225,8 @@ export function createWorkspace(client: Client, initialProfiles: Profile[] = loa
     }
   }
   function saveProfile(profile: Profile) {
-    const profiles = [...state.profiles.filter((p) => p.id !== profile.id), profile].sort((a, b) =>
+    const safe = profileMetadata(profile);
+    const profiles = [...state.profiles.filter((p) => p.id !== safe.id), safe].sort((a, b) =>
       a.name.localeCompare(b.name),
     );
     // Whitelist fields at the persistence boundary, even if callers pass extra properties.
@@ -320,7 +321,7 @@ export function createWorkspace(client: Client, initialProfiles: Profile[] = loa
         saveProfile(profile);
         update({
           phase: 'connected',
-          session: { ...profile, cwd: result.cwd, id: crypto.randomUUID() },
+          session: { ...profileMetadata(profile), cwd: result.cwd, id: crypto.randomUUID() },
           queue: [],
           paused: false,
         });

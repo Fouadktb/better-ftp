@@ -98,6 +98,13 @@ jobs:
       - run: rustup update stable --no-self-update
       - run: rustup default stable
       - run: rustup target add ${{ matrix.target }}
+      - name: Cache Rust installer dependencies
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          workspaces: src-tauri -> target
+          key: installers-${{ matrix.os }}-${{ matrix.target }}
+          cache-bin: false
+          save-if: ${{ github.event_name != 'pull_request' }}
       - run: npm ci
       - name: Build installers (unsigned alpha; macOS ad-hoc only)
         uses: tauri-apps/tauri-action@1deb371b0cd8bd54025b384f1cd735e725c4060f # v1
