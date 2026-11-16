@@ -1,0 +1,168 @@
+name: Prepare prerelease
+
+on:
+  push:
+    tags: ['v*-*']
+  workflow_dispatch:
+    inputs:
+      create_draft:
+        description: Create/update a draft prerelease (requires an existing matching version tag)
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: prerelease-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  preflight:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      tag: ${{ steps.version.outputs.tag }}
+      draft: ${{ steps.version.outputs.draft }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24
+      - run: node scripts/sync-version.mjs --check
+      - name: Validate prerelease source and tag
+        id: version
+        env:
+          EVENT: ${{ github.event_name }}
+          REF_NAME: ${{ github.ref_name }}
+          CREATE_DRAFT: ${{ inputs.create_draft }}
+        run: |
+          node --input-type=module <<'NODE'
+          import { readFileSync, appendFileSync, existsSync } from 'node:fs';
+          import { execFileSync } from 'node:child_process';
+          import { validateVersion } from './scripts/sync-version.mjs';
+          const version = validateVersion(JSON.parse(readFileSync('package.json', 'utf8')).version);
+          if (!/^\d+\.\d+\.\d+-/.test(version)) throw new Error('This workflow accepts prerelease versions only.');
+          const tag = `v${version}`;
+          const draft = process.env.EVENT === 'push' || process.env.CREATE_DRAFT === 'true';
+          if (process.env.EVENT === 'push' && process.env.REF_NAME !== tag) throw new Error('Tag does not match package.json version.');
+          if (draft) {
+            if (!existsSync('LICENSE') && !existsSync('LICENSE.md') && !existsSync('LICENSE.txt')) throw new Error('Owner must select and add a project license before release preparation.');
+            const head = execFileSync('git', ['rev-parse', 'HEAD'], { encoding: 'utf8' }).trim();
+            const tagged = execFileSync('git', ['rev-parse', `refs/tags/${tag}^{commit}`], { encoding: 'utf8' }).trim();
+            if (head !== tagged) throw new Error('Draft release requires the matching version tag on this exact commit.');
+          }
+          appendFileSync(process.env.GITHUB_OUTPUT, `version=${version}\ntag=${tag}\ndraft=${draft}\n`);
+          NODE
+
+  checks:
+    needs: preflight
+    uses: ./.github/workflows/checks.yml
+
+  installers:
+    needs: [preflight, checks]
+    name: Installer (${{ matrix.target }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+            bundles: deb,appimage
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            bundles: nsis
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            bundles: dmg
+          - os: macos-latest
+            target: x86_64-apple-darwin
+            bundles: dmg
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24
+          cache: npm
+      - name: Install Linux bundle prerequisites
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev build-essential curl wget file libxdo-dev libssl-dev librsvg2-dev libayatana-appindicator3-dev patchelf xdg-utils
+      - run: rustup update stable --no-self-update
+      - run: rustup default stable
+      - run: rustup target add ${{ matrix.target }}
+      - run: npm ci
+      - name: Build installers (unsigned alpha; macOS ad-hoc only)
+        uses: tauri-apps/tauri-action@1deb371b0cd8bd54025b384f1cd735e725c4060f # v1
+        env:
+          APPLE_SIGNING_IDENTITY: '-'
+        with:
+          args: --target ${{ matrix.target }} --bundles ${{ matrix.bundles }} -- --locked
+          uploadUpdaterJson: false
+          uploadUpdaterSignatures: false
+      - name: Store installer artifacts
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: better-ftp-${{ needs.preflight.outputs.version }}-${{ matrix.target }}
+          if-no-files-found: error
+          retention-days: 14
+          path: |
+            src-tauri/target/${{ matrix.target }}/release/bundle/**/*.dmg
+            src-tauri/target/${{ matrix.target }}/release/bundle/**/*.deb
+            src-tauri/target/${{ matrix.target }}/release/bundle/**/*.AppImage
+            src-tauri/target/${{ matrix.target }}/release/bundle/**/*.exe
+
+  draft:
+    name: Assemble draft prerelease
+    needs: [preflight, installers]
+    if: needs.preflight.outputs.draft == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: better-ftp-${{ needs.preflight.outputs.version }}-*
+          path: release-assets
+          merge-multiple: true
+      - name: Create checksums and draft release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.preflight.outputs.tag }}
+        run: |
+          mkdir release-flat
+          while IFS= read -r -d '' asset; do
+            name=$(basename "$asset")
+            if [[ -e "release-flat/$name" ]]; then
+              echo "Duplicate installer filename: $name" >&2
+              exit 1
+            fi
+            cp "$asset" "release-flat/$name"
+          done < <(find release-assets -type f -print0)
+          (cd release-flat && sha256sum * > SHA256SUMS)
+          cat > release-notes.md <<'NOTES'
+          Alpha testing build. This release remains a draft until a maintainer reviews every artifact and release gate.
+
+          Windows and Linux installers are unsigned. macOS installers use ad-hoc signing and are not Developer ID signed or notarized. Operating-system trust checks may warn or block installation. No automatic updater is included.
+
+          Verify the platform and SHA256SUMS before testing. See CHANGELOG.md and docs/RELEASING.md at this tag for scope, known limitations, and remaining acceptance gates.
+          NOTES
+          if gh release view "$TAG" --json isDraft > existing-release.json; then
+            node -e "if (!JSON.parse(require('fs').readFileSync('existing-release.json')).isDraft) throw new Error('Refusing to modify a published release');"
+          else
+            gh release create "$TAG" --verify-tag --draft --prerelease --title "Better FTP $TAG (alpha)" --notes-file release-notes.md
+          fi
+          mapfile -d '' assets < <(find release-flat -type f -print0)
+          gh release upload "$TAG" "${assets[@]}" --clobber
+          echo "Draft only: review and publication remain a maintainer action."
