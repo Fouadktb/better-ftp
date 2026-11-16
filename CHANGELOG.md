@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+## 0.1.0-alpha.2 — 2026-11-16
+
+### Fixed
+
+- Normalize installer asset filenames before checksumming to match GitHub download filenames. The alpha.1 draft used spaces in SHA256SUMS while GitHub converted asset names to periods.
+- Application behavior is unchanged; all alpha.1 limitations and publication gates still apply.
+
 ## 0.1.0-alpha.1 — 2026-11-16
 
 First alpha. Installer builds and platform smoke tests remain release gates; this is not a stable release.

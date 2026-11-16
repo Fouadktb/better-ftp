@@ -4,7 +4,7 @@ Release preparation creates reviewable installers and a draft prerelease. Publis
 
 ## Current readiness
 
-The repository destination is [Fouadktb/better-ftp](https://github.com/Fouadktb/better-ftp), selected by the owner with the [MIT license](../LICENSE). The first prerelease version is `0.1.0-alpha.1`. Package, lockfile, Tauri, and Cargo versions are synchronized.
+The repository destination is [Fouadktb/better-ftp](https://github.com/Fouadktb/better-ftp), selected by the owner with the [MIT license](../LICENSE). The current draft prerelease version is `0.1.0-alpha.2`. The original `alpha.1` tag is preserved; `alpha.2` corrects GitHub asset filename normalization in the checksum manifest. Package, lockfile, Tauri, and Cargo versions are synchronized.
 
 Local alpha validation covers frontend tests/build and native macOS FTP/SFTP integration. GitHub installer builds and platform smoke results are recorded separately; creating a draft does not imply signing or production readiness.
 

@@ -1,6 +1,6 @@
 [package]
 name = "better-ftp"
-version = "0.1.0-alpha.1"
+version = "0.1.0-alpha.2"
 description = "A modern desktop FTP client"
 license = "MIT"
 repository = "https://github.com/Fouadktb/better-ftp"
