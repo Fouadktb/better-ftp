@@ -4,9 +4,9 @@
 
 A desktop FTP, FTPS, and SFTP client built with Rust, Tauri 2, React, and TypeScript. Targets Windows, macOS, and Linux.
 
-**Version:** `0.1.0-alpha.2` · **License:** [MIT](LICENSE) · **Repository:** [Fouadktb/better-ftp](https://github.com/Fouadktb/better-ftp)
+**Version:** `0.1.0-alpha.3` · **License:** [MIT](LICENSE) · **Repository:** [Fouadktb/better-ftp](https://github.com/Fouadktb/better-ftp)
 
-This is an alpha, not a stable replacement yet. See the [FileZilla comparison](docs/FILEZILLA_COMPARISON.md), [delivery plan](docs/PLAN.md), and [release process](docs/RELEASING.md) for scope and remaining gates.
+Download the latest alpha installers from [GitHub Releases](https://github.com/Fouadktb/better-ftp/releases). This is an alpha, not a stable replacement yet. See the [FileZilla comparison](docs/FILEZILLA_COMPARISON.md), [delivery plan](docs/PLAN.md), and [release process](docs/RELEASING.md) for scope and remaining gates.
 
 ## Run from source
 
@@ -24,6 +24,8 @@ Linux needs WebKitGTK 4.1 and related development libraries; Windows needs the C
 ## Connections
 
 Choose **New connection** and set protocol, host, port, username, and authentication:
+
+**Abort connection** stops connection setup and keeps your form edits for retry. The toolbar provides **Disconnect** and **Reconnect**; reconnect restores the last server settings and asks for a fresh password or key passphrase. Finish or cancel pending transfers before disconnecting or reconnecting.
 
 | Protocol           | Default port | Authentication                                                       |
 | ------------------ | ------------ | -------------------------------------------------------------------- |

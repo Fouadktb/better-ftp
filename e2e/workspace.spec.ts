@@ -87,6 +87,8 @@ test('queue pauses between files and cancellation closes the connection', async 
   await local.getByRole('checkbox', { name: 'Select app.tsx', exact: true }).check();
   await local.getByRole('checkbox', { name: 'Select README.md', exact: true }).check();
   await local.getByRole('button', { name: 'Upload 2', exact: true }).click();
+  await expect(page.getByRole('button', { name: 'Disconnect', exact: true })).toBeDisabled();
+  await expect(page.getByRole('button', { name: 'Reconnect', exact: true })).toBeDisabled();
   await page.getByRole('button', { name: 'Pause queue', exact: true }).click();
   await expect(page.getByRole('tab', { name: 'Completed 1', exact: true })).toBeVisible();
   await expect(page.locator('.transfer-state.queued')).toHaveCount(1);
@@ -253,15 +255,7 @@ test('unchanged saved connections dismiss without a discard warning', async ({ p
 });
 
 test('a pending connection cannot be accidentally dismissed', async ({ page }) => {
-  await page.route(/\/src\/bridge\.ts(?:\?.*)?$/, (route) =>
-    route.fulfill({
-      contentType: 'text/javascript',
-      body: fixture.replace(
-        'async connect(profile, password) {',
-        'async connect(profile, password) { await new Promise(resolve=>setTimeout(resolve,1500));',
-      ),
-    }),
-  );
+  await inject(page);
   await page.goto('/');
   await page
     .getByRole('button', { name: /^Connect/ })
@@ -270,6 +264,7 @@ test('a pending connection cannot be accidentally dismissed', async ({ page }) =
   const dialog = page.getByRole('dialog', { name: 'New connection', exact: true });
   await dialog.getByRole('textbox', { name: 'Host', exact: true }).fill('ftp.example.test');
   await dialog.getByRole('textbox', { name: 'Username', exact: true }).fill('test');
+  await dialog.locator('input[name=password]').fill('slow');
   await dialog.getByRole('button', { name: 'Connect', exact: true }).click();
   await expect(dialog.getByRole('button', { name: 'Connecting…', exact: true })).toBeDisabled();
   await page
@@ -394,4 +389,85 @@ test('changed SSH host keys are blocked without a trust bypass', async ({ page }
   ).toBeNull();
   await changed.getByRole('button', { name: 'Close', exact: true }).click();
   await expect(dialog).toBeVisible();
+});
+
+test('abort SSH verification, retain edits, and ignore the old response after retry', async ({
+  page,
+}) => {
+  await inject(page);
+  await page.goto('/');
+  await page
+    .getByRole('button', { name: /^Connect/ })
+    .first()
+    .click();
+  const dialog = page.getByRole('dialog');
+  await dialog.getByRole('textbox', { name: 'Connection name', exact: true }).fill('Slow server');
+  await dialog.getByRole('textbox', { name: 'Host', exact: true }).fill('slow.example.test');
+  await dialog.getByRole('textbox', { name: 'Username', exact: true }).fill('deploy');
+  await dialog.locator('input[name=password]').fill('secret');
+  await dialog.getByRole('button', { name: 'Connect', exact: true }).click();
+  await dialog.getByRole('button', { name: 'Abort connection', exact: true }).click();
+  await expect(dialog.getByRole('button', { name: 'Connect', exact: true })).toBeEnabled();
+  await expect(dialog.getByRole('textbox', { name: 'Host', exact: true })).toHaveValue(
+    'slow.example.test',
+  );
+  await expect(dialog.locator('input[name=password]')).toHaveValue('secret');
+  await dialog.getByRole('textbox', { name: 'Host', exact: true }).fill('ftp.example.test');
+  await dialog.getByRole('button', { name: 'Connect', exact: true }).click();
+  await expect(dialog).toHaveCount(0);
+  await expect(page.getByText('deploy@ftp.example.test:22', { exact: true })).toBeVisible();
+  // Wait beyond the old fixture response to detect stale dialogs/errors or sessions.
+  await page.waitForTimeout(1700);
+  await expect(dialog).toHaveCount(0);
+  await expect(page.getByText('deploy@ftp.example.test:22', { exact: true })).toBeVisible();
+});
+
+test('abort authentication and retry without losing form contents', async ({ page }) => {
+  await inject(page);
+  await page.goto('/');
+  await page
+    .getByRole('button', { name: /^Connect/ })
+    .first()
+    .click();
+  const dialog = page.getByRole('dialog');
+  await dialog.getByRole('textbox', { name: 'Host', exact: true }).fill('ftp.example.test');
+  await dialog.getByRole('textbox', { name: 'Username', exact: true }).fill('deploy');
+  await dialog.locator('input[name=password]').fill('slow');
+  await dialog.getByRole('button', { name: 'Connect', exact: true }).click();
+  await dialog.getByRole('button', { name: 'Abort connection', exact: true }).click();
+  await expect(dialog.getByRole('button', { name: 'Connect', exact: true })).toBeEnabled();
+  await dialog.locator('input[name=password]').fill('good');
+  await dialog.getByRole('button', { name: 'Connect', exact: true }).click();
+  await expect(dialog).toHaveCount(0);
+  await page.waitForTimeout(1700);
+  await expect(page.getByRole('button', { name: 'Disconnect', exact: true })).toBeEnabled();
+});
+
+test('reconnect restores the same server settings and requests a fresh password', async ({
+  page,
+}) => {
+  await inject(page);
+  await page.goto('/');
+  await connect(page);
+  await page.getByRole('button', { name: 'Reconnect', exact: true }).click();
+  let dialog = page.getByRole('dialog');
+  await expect(dialog.getByRole('textbox', { name: 'Host', exact: true })).toHaveValue(
+    'ftp.example.test',
+  );
+  await expect(dialog.getByRole('textbox', { name: 'Username', exact: true })).toHaveValue(
+    'deploy',
+  );
+  await expect(dialog.locator('input[name=password]')).toHaveValue('');
+  await dialog.locator('input[name=password]').fill('fresh');
+  await dialog.getByRole('button', { name: 'Reconnect', exact: true }).click();
+  await expect(dialog).toHaveCount(0);
+  await page.getByRole('button', { name: 'Disconnect', exact: true }).click();
+  await expect(page.getByText('Disconnected', { exact: true })).toBeVisible();
+  await page.getByRole('button', { name: 'Reconnect', exact: true }).click();
+  dialog = page.getByRole('dialog');
+  await expect(dialog.getByRole('textbox', { name: 'Host', exact: true })).toHaveValue(
+    'ftp.example.test',
+  );
+  await expect(dialog.locator('input[name=password]')).toHaveValue('');
+  expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
 });

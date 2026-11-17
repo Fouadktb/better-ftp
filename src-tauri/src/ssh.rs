@@ -1,5 +1,9 @@
 //! SFTP authentication and first-use trust. Verification always precedes credentials.
-use crate::{model::*, path_text, remote_path, sorted, timestamp, validate_argument};
+use crate::{
+    attempt::{self, Attempt},
+    model::*,
+    path_text, remote_path, sorted, timestamp, validate_argument,
+};
 use base64::{
     engine::general_purpose::{STANDARD, STANDARD_NO_PAD},
     Engine,
@@ -9,8 +13,9 @@ use sha2::{Digest, Sha256};
 use std::{
     fs::{self, OpenOptions},
     io::Write,
-    net::{IpAddr, TcpStream, ToSocketAddrs},
+    net::{IpAddr, TcpStream},
     path::Path,
+    sync::Arc,
     time::{Duration, SystemTime},
 };
 
@@ -92,30 +97,15 @@ fn fingerprint(key: &[u8]) -> String {
     format!("SHA256:{}", STANDARD_NO_PAD.encode(Sha256::digest(key)))
 }
 
-fn handshake(host: &str, port: u16, timeout: Duration) -> Result<Handshake, String> {
+fn handshake(
+    host: &str,
+    port: u16,
+    timeout: Duration,
+    attempt: &Arc<Attempt>,
+) -> Result<Handshake, String> {
     let host = normalize_host(host)?;
     endpoint(&host, port)?;
-    let addresses = (host.as_str(), port)
-        .to_socket_addrs()
-        .map_err(|e| format!("Cannot resolve SSH host: {e}"))?;
-    let deadline = std::time::Instant::now() + timeout;
-    let mut socket = None;
-    for address in addresses {
-        let Some(remaining) = deadline.checked_duration_since(std::time::Instant::now()) else {
-            break;
-        };
-        if let Ok(stream) = TcpStream::connect_timeout(&address, remaining) {
-            socket = Some(stream);
-            break;
-        }
-    }
-    let socket = socket.ok_or("Cannot reach the SSH server. Check the host, port, and network.")?;
-    socket
-        .set_read_timeout(Some(timeout))
-        .map_err(|e| e.to_string())?;
-    socket
-        .set_write_timeout(Some(timeout))
-        .map_err(|e| e.to_string())?;
+    let socket = attempt::connect(&host, port, timeout, attempt)?;
     let mut session = ssh2::Session::new().map_err(|e| format!("Cannot initialize SSH: {e}"))?;
     session.set_timeout(timeout.as_millis() as u32);
     session.set_tcp_stream(socket.try_clone().map_err(|e| e.to_string())?);
@@ -123,6 +113,7 @@ fn handshake(host: &str, port: u16, timeout: Duration) -> Result<Handshake, Stri
     session
         .handshake()
         .map_err(|e| format!("SSH handshake failed: {e}"))?;
+    attempt.check()?;
     let (key, kind) = session
         .host_key()
         .ok_or("The SSH server supplied no host key.")?;
@@ -194,7 +185,7 @@ fn status(entries: &[(String, HostKey)], endpoint: &str, key: &HostKey) -> Trust
         TrustStatus::Unknown
     }
 }
-fn trust_lock(path: &Path) -> Result<std::fs::File, String> {
+fn trust_lock(path: &Path, attempt: &Arc<Attempt>) -> Result<std::fs::File, String> {
     let parent = path.parent().ok_or("Invalid SSH trust store location.")?;
     fs::create_dir_all(parent)
         .map_err(|e| format!("Cannot create SSH configuration folder: {e}"))?;
@@ -205,7 +196,16 @@ fn trust_lock(path: &Path) -> Result<std::fs::File, String> {
         .write(true)
         .open(path.with_extension("lock"))
         .map_err(|e| format!("Cannot open SSH trust lock: {e}"))?;
-    fs2::FileExt::lock_exclusive(&file).map_err(|e| format!("Cannot lock SSH trust store: {e}"))?;
+    loop {
+        attempt.check()?;
+        match fs2::FileExt::try_lock_exclusive(&file) {
+            Ok(()) => break,
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                std::thread::sleep(Duration::from_millis(25))
+            }
+            Err(e) => return Err(format!("Cannot lock SSH trust store: {e}")),
+        }
+    }
     Ok(file)
 }
 fn inspect_handshake(
@@ -213,8 +213,9 @@ fn inspect_handshake(
     port: u16,
     key: &HostKey,
     path: &Path,
+    attempt: &Arc<Attempt>,
 ) -> Result<HostInspection, String> {
-    let _lock = trust_lock(path)?;
+    let _lock = trust_lock(path, attempt)?;
     let endpoint = endpoint(host, port)?;
     Ok(HostInspection {
         host: normalize_host(host)?,
@@ -225,16 +226,48 @@ fn inspect_handshake(
     })
 }
 
+#[cfg(test)]
 pub(crate) fn inspect(input: HostInput, path: &Path) -> Result<HostInspection, String> {
-    let handshake = handshake(&input.host, input.port, timeout(input.timeout_seconds)?)?;
-    inspect_handshake(&input.host, input.port, &handshake.key, path)
+    inspect_with_attempt(input, path, &Arc::new(Attempt::default()))
 }
+pub(crate) fn inspect_with_attempt(
+    input: HostInput,
+    path: &Path,
+    attempt: &Arc<Attempt>,
+) -> Result<HostInspection, String> {
+    let handshake = handshake(
+        &input.host,
+        input.port,
+        timeout(input.timeout_seconds)?,
+        attempt,
+    )?;
+    attempt.result(inspect_handshake(
+        &input.host,
+        input.port,
+        &handshake.key,
+        path,
+        attempt,
+    ))
+}
+#[cfg(test)]
 pub(crate) fn trust(input: TrustInput, path: &Path) -> Result<HostInspection, String> {
-    let handshake = handshake(&input.host, input.port, timeout(input.timeout_seconds)?)?;
+    trust_with_attempt(input, path, &Arc::new(Attempt::default()))
+}
+pub(crate) fn trust_with_attempt(
+    input: TrustInput,
+    path: &Path,
+    attempt: &Arc<Attempt>,
+) -> Result<HostInspection, String> {
+    let handshake = handshake(
+        &input.host,
+        input.port,
+        timeout(input.timeout_seconds)?,
+        attempt,
+    )?;
     if fingerprint(&handshake.key.key) != input.fingerprint {
         return Err("SSH host key no longer matches the fingerprint you reviewed. Inspect it again before trusting.".into());
     }
-    let _lock = trust_lock(path)?;
+    let _lock = trust_lock(path, attempt)?;
     let endpoint = endpoint(&input.host, input.port)?;
     let mut entries = read_hosts(path)?;
     match status(&entries, &endpoint, &handshake.key) {
@@ -246,7 +279,7 @@ pub(crate) fn trust(input: TrustInput, path: &Path) -> Result<HostInspection, St
             for (host, key) in entries { writeln!(file, "{} {} {}", host, key.key_type, STANDARD.encode(key.key)).map_err(|e| e.to_string())?; }
             file.flush().map_err(|e| e.to_string())?;
             file.as_file().sync_all().map_err(|e| e.to_string())?;
-            file.persist(path).map_err(|e| format!("Cannot save SSH trust: {}", e.error))?;
+            attempt.commit(|| { file.persist(path).map_err(|e| format!("Cannot save SSH trust: {}", e.error))?; Ok(()) })?;
         }
     }
     Ok(HostInspection {
@@ -258,13 +291,18 @@ pub(crate) fn trust(input: TrustInput, path: &Path) -> Result<HostInspection, St
     })
 }
 
-pub(crate) fn connect(input: &ConnectionInput, path: &Path) -> Result<SftpClient, String> {
-    let handshake = handshake(&input.host, input.port, input.timeout()?)?;
-    match inspect_handshake(&input.host, input.port, &handshake.key, path)?.status {
+pub(crate) fn connect(
+    input: &ConnectionInput,
+    path: &Path,
+    attempt: &Arc<Attempt>,
+) -> Result<SftpClient, String> {
+    let handshake = handshake(&input.host, input.port, input.timeout()?, attempt)?;
+    match inspect_handshake(&input.host, input.port, &handshake.key, path, attempt)?.status {
         TrustStatus::Trusted => {},
         TrustStatus::Unknown => return Err("SSH host key is unknown. Inspect and trust its SHA256 fingerprint before connecting.".into()),
         TrustStatus::Changed => return Err("SSH host key changed. Connection blocked. Verify the server and manage the application's known_hosts entry manually.".into()),
     }
+    attempt.check()?;
     // Host identity was checked on this exact session before sending any authentication material.
     match input.auth_method {
         AuthMethod::Password => handshake.session.userauth_password(&input.username, &input.password).map_err(|_| "SSH password authentication failed. Check your username, password, and server authentication settings.".to_string())?,
@@ -281,10 +319,11 @@ pub(crate) fn connect(input: &ConnectionInput, path: &Path) -> Result<SftpClient
             let identities = agent.identities().map_err(|e| format!("Cannot read SSH agent identities: {e}"))?;
             if identities.is_empty() { return Err("The SSH agent contains no identities.".into()); }
             let mut authenticated = false;
-            for identity in identities.iter().take(16) { if agent.userauth(&input.username, identity).is_ok() { authenticated = true; break; } }
+            for identity in identities.iter().take(16) { attempt.check()?; if agent.userauth(&input.username, identity).is_ok() { authenticated = true; break; } }
             if !authenticated { return Err("SSH agent authentication failed. None of the first 16 identities was accepted.".into()); }
         }
     }
+    attempt.check()?;
     if !handshake.session.authenticated() {
         return Err("SSH authentication was not completed.".into());
     }
@@ -292,6 +331,7 @@ pub(crate) fn connect(input: &ConnectionInput, path: &Path) -> Result<SftpClient
         .session
         .sftp()
         .map_err(|e| format!("Cannot start the SFTP subsystem: {e}"))?;
+    attempt.check()?;
     Ok(SftpClient {
         sftp,
         socket: handshake.socket,

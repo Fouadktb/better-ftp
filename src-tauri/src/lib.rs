@@ -1,3 +1,4 @@
+mod attempt;
 mod ftp;
 mod model;
 mod remote;
@@ -12,6 +13,7 @@ use remote::RemoteClient;
 use std::{
     fs,
     path::{Path, PathBuf},
+    sync::atomic::{AtomicU64, Ordering},
     sync::{Arc, Mutex, RwLock},
     time::SystemTime,
 };
@@ -21,6 +23,9 @@ type Session = Arc<SessionState>;
 
 struct SessionState {
     remote: Mutex<Option<RemoteClient>>,
+    attempt: Mutex<Option<(String, Arc<attempt::Attempt>)>>,
+    connected_attempt: Mutex<Option<String>>,
+    next_attempt: AtomicU64,
     known_hosts: PathBuf,
     info: RwLock<Option<SessionInfo>>,
     active: Mutex<Option<Arc<transfer::ActiveTransfer>>>,
@@ -39,6 +44,9 @@ impl SessionState {
     fn with_known_hosts(known_hosts: PathBuf) -> Self {
         Self {
             remote: Mutex::new(None),
+            attempt: Mutex::new(None),
+            connected_attempt: Mutex::new(None),
+            next_attempt: AtomicU64::new(1),
             info: RwLock::new(None),
             active: Mutex::new(None),
             known_hosts,
@@ -88,6 +96,9 @@ fn clear_session(session: &Session, remote: &mut Option<RemoteClient>) {
     if let Some(ftp) = remote.take() {
         ftp.shutdown();
     }
+    if let Ok(mut installed) = session.connected_attempt.lock() {
+        *installed = None;
+    }
     if let Ok(mut info) = session.info.write() {
         *info = None;
     }
@@ -112,34 +123,129 @@ fn get_session(state: tauri::State<'_, AppState>) -> Result<Option<SessionInfo>,
     session_info(&state.session)
 }
 
+fn begin_attempt(session: &Session) -> Result<String, String> {
+    let mut current = session
+        .attempt
+        .lock()
+        .map_err(|_| "Connection attempt unavailable.")?;
+    if current
+        .as_ref()
+        .is_some_and(|(_, token)| !token.cancelled())
+    {
+        return Err("A connection attempt is already running.".into());
+    }
+    let id = session
+        .next_attempt
+        .fetch_add(1, Ordering::Relaxed)
+        .to_string();
+    *current = Some((id.clone(), Arc::new(attempt::Attempt::default())));
+    Ok(id)
+}
+fn attempt_token(session: &Session, id: Option<&str>) -> Result<Arc<attempt::Attempt>, String> {
+    let Some(id) = id else {
+        return Ok(Arc::new(attempt::Attempt::default()));
+    };
+    let current = session
+        .attempt
+        .lock()
+        .map_err(|_| "Connection attempt unavailable.")?;
+    let token = current
+        .as_ref()
+        .filter(|(current_id, _)| current_id == id)
+        .map(|(_, token)| token.clone())
+        .ok_or(attempt::CANCELLED)?;
+    token.check()?;
+    Ok(token)
+}
+fn cancel_attempt(session: &Session, id: &str) -> Result<(), String> {
+    let current = session
+        .attempt
+        .lock()
+        .map_err(|_| "Connection attempt unavailable.")?;
+    if let Some((_, token)) = current.as_ref().filter(|(current_id, _)| current_id == id) {
+        token.cancel()?;
+    }
+    drop(current);
+    let mut slot = session.remote.lock().map_err(|_| "Session unavailable.")?;
+    let installed = session
+        .connected_attempt
+        .lock()
+        .map_err(|_| "Session unavailable.")?
+        .clone();
+    if installed.as_deref() == Some(id) {
+        clear_session(session, &mut slot);
+    }
+    Ok(())
+}
+#[tauri::command]
+fn begin_connection_attempt(state: tauri::State<'_, AppState>) -> Result<String, String> {
+    begin_attempt(&state.session)
+}
+#[tauri::command]
+async fn cancel_connection_attempt(
+    state: tauri::State<'_, AppState>,
+    id: String,
+) -> Result<(), String> {
+    let session = state.session.clone();
+    blocking(move || cancel_attempt(&session, &id)).await
+}
+#[tauri::command]
+fn end_connection_attempt(state: tauri::State<'_, AppState>, id: String) -> Result<(), String> {
+    let mut current = state
+        .session
+        .attempt
+        .lock()
+        .map_err(|_| "Connection attempt unavailable.")?;
+    if current
+        .as_ref()
+        .is_some_and(|(current_id, _)| current_id == &id)
+    {
+        *current = None;
+    }
+    Ok(())
+}
 #[tauri::command]
 async fn inspect_ssh_host(
     state: tauri::State<'_, AppState>,
     input: ssh::HostInput,
+    attempt_id: Option<String>,
 ) -> Result<ssh::HostInspection, String> {
     let path = state.session.known_hosts.clone();
-    blocking(move || ssh::inspect(input, &path)).await
+    let token = attempt_token(&state.session, attempt_id.as_deref())?;
+    blocking(move || token.result(ssh::inspect_with_attempt(input, &path, &token))).await
 }
-
 #[tauri::command]
 async fn trust_ssh_host(
     state: tauri::State<'_, AppState>,
     input: ssh::TrustInput,
+    attempt_id: Option<String>,
 ) -> Result<ssh::HostInspection, String> {
     let path = state.session.known_hosts.clone();
-    blocking(move || ssh::trust(input, &path)).await
+    let token = attempt_token(&state.session, attempt_id.as_deref())?;
+    blocking(move || token.result(ssh::trust_with_attempt(input, &path, &token))).await
 }
-
 #[tauri::command]
 async fn connect_remote(
     state: tauri::State<'_, AppState>,
     input: ConnectionInput,
+    attempt_id: Option<String>,
 ) -> Result<ConnectionResult, String> {
     let session = state.session.clone();
-    blocking(move || connect_session(session, input)).await
+    let token = attempt_token(&session, attempt_id.as_deref())?;
+    blocking(move || token.result(connect_session_attempt(session, input, &token, attempt_id)))
+        .await
 }
-
+#[cfg(test)]
 fn connect_session(session: Session, input: ConnectionInput) -> Result<ConnectionResult, String> {
+    connect_session_attempt(session, input, &Arc::new(attempt::Attempt::default()), None)
+}
+fn connect_session_attempt(
+    session: Session,
+    input: ConnectionInput,
+    token: &Arc<attempt::Attempt>,
+    attempt_id: Option<String>,
+) -> Result<ConnectionResult, String> {
+    token.check()?;
     let protocol = input.protocol();
     validate_argument(&input.host)?;
     for value in [&input.username, &input.password] {
@@ -157,29 +263,43 @@ fn connect_session(session: Session, input: ConnectionInput) -> Result<Connectio
     if input.host.trim().is_empty() || input.port == 0 {
         return Err("Enter a host and valid port.".into());
     }
-    let mut slot = session.remote.lock().map_err(|_| "Session unavailable.")?;
-    if slot.is_some() {
+    if session
+        .remote
+        .lock()
+        .map_err(|_| "Session unavailable.")?
+        .is_some()
+    {
         return Err("Disconnect the current session before connecting again.".into());
     }
     if protocol != Protocol::Sftp && input.auth_method != AuthMethod::Password {
         return Err("FTP and FTPS support password authentication only.".into());
     }
     let mut remote = match protocol {
-        Protocol::Sftp => RemoteClient::Sftp(ssh::connect(&input, &session.known_hosts)?),
-        Protocol::Ftp | Protocol::Ftps => RemoteClient::Ftp(ftp::connect(&input)?),
+        Protocol::Sftp => RemoteClient::Sftp(ssh::connect(&input, &session.known_hosts, token)?),
+        Protocol::Ftp | Protocol::Ftps => RemoteClient::Ftp(ftp::connect(&input, token)?),
     };
     let cwd = remote.initial_directory(input.remote_path.as_deref())?;
-    *session.info.write().map_err(|_| "Session unavailable.")? = Some(SessionInfo {
-        host: input.host,
-        port: input.port,
-        username: input.username,
-        secure: protocol != Protocol::Ftp,
-        protocol,
-        auth_method: input.auth_method,
-        cwd: cwd.clone(),
-    });
-    *slot = Some(remote);
-    Ok(ConnectionResult { cwd })
+    let mut slot = session.remote.lock().map_err(|_| "Session unavailable.")?;
+    token.commit(|| {
+        if slot.is_some() {
+            return Err("Disconnect the current session before connecting again.".into());
+        }
+        *session.info.write().map_err(|_| "Session unavailable.")? = Some(SessionInfo {
+            host: input.host,
+            port: input.port,
+            username: input.username,
+            secure: protocol != Protocol::Ftp,
+            protocol,
+            auth_method: input.auth_method,
+            cwd: cwd.clone(),
+        });
+        *session
+            .connected_attempt
+            .lock()
+            .map_err(|_| "Session unavailable.")? = attempt_id;
+        *slot = Some(remote);
+        Ok(ConnectionResult { cwd })
+    })
 }
 
 #[tauri::command]
@@ -350,6 +470,9 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             get_session,
+            begin_connection_attempt,
+            cancel_connection_attempt,
+            end_connection_attempt,
             inspect_ssh_host,
             trust_ssh_host,
             connect_remote,

@@ -25,7 +25,7 @@ export default function HostKeyDialog({
           className="dialog-content discard-content host-key-dialog"
           onEscapeKeyDown={(event) => {
             event.preventDefault();
-            if (!busy) onCancel();
+            onCancel();
           }}
           onOpenAutoFocus={(event) => {
             event.preventDefault();
@@ -64,8 +64,8 @@ export default function HostKeyDialog({
             </p>
           )}
           <div className="dialog-actions">
-            <Button ref={cancel} disabled={busy} onClick={onCancel}>
-              {changed ? 'Close' : 'Cancel'}
+            <Button ref={cancel} onClick={onCancel}>
+              {busy ? 'Abort connection' : changed ? 'Close' : 'Cancel'}
             </Button>
             {!changed && (
               <Button variant="primary" disabled={busy} onClick={onTrust}>

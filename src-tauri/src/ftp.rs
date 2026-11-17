@@ -1,31 +1,21 @@
 //! FTP/explicit-FTPS adapter. Credentials never leave the connection worker.
-use crate::{model::*, remote_path, sorted, timestamp, validate_argument};
-use std::{
-    net::{TcpStream, ToSocketAddrs},
-    time::SystemTime,
+use crate::{
+    attempt::{self, Attempt},
+    model::*,
+    remote_path, sorted, timestamp, validate_argument,
 };
+use std::{net::TcpStream, sync::Arc, time::SystemTime};
 use suppaftp::{
     list::ListParser, native_tls::TlsConnector, types::FileType, FtpError, NativeTlsConnector,
     NativeTlsFtpStream,
 };
 
-pub(crate) fn connect(input: &ConnectionInput) -> Result<NativeTlsFtpStream, String> {
+pub(crate) fn connect(
+    input: &ConnectionInput,
+    attempt: &Arc<Attempt>,
+) -> Result<NativeTlsFtpStream, String> {
     let timeout = input.timeout()?;
-    let addresses = (input.host.as_str(), input.port)
-        .to_socket_addrs()
-        .map_err(|e| format!("Cannot resolve host: {e}"))?;
-    let mut tcp = None;
-    for address in addresses {
-        if let Ok(stream) = TcpStream::connect_timeout(&address, timeout) {
-            tcp = Some(stream);
-            break;
-        }
-    }
-    let tcp = tcp.ok_or("Cannot reach the server. Check the host, port, and network.")?;
-    tcp.set_read_timeout(Some(timeout))
-        .map_err(|e| e.to_string())?;
-    tcp.set_write_timeout(Some(timeout))
-        .map_err(|e| e.to_string())?;
+    let tcp = attempt::connect(&input.host, input.port, timeout, attempt)?;
     let mut ftp = NativeTlsFtpStream::connect_with_stream(tcp)
         .map_err(|e| format!("FTP handshake failed: {e}"))?;
     ftp = ftp.passive_stream_builder(move |address| {
@@ -47,10 +37,12 @@ pub(crate) fn connect(input: &ConnectionInput) -> Result<NativeTlsFtpStream, Str
             .into_secure(NativeTlsConnector::from(connector), &input.host)
             .map_err(|e| format!("Secure connection failed: {e}"))?;
     }
+    attempt.check()?;
     ftp.login(&input.username, &input.password)
         .map_err(|_| "Login failed. Check your credentials and server permissions.".to_string())?;
     ftp.transfer_type(FileType::Binary)
         .map_err(|e| format!("Cannot select binary transfer mode: {e}"))?;
+    attempt.check()?;
     Ok(ftp)
 }
 fn command_unsupported(error: &FtpError) -> bool {

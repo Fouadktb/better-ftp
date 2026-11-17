@@ -32,6 +32,7 @@ export interface LogEntry {
 export interface WorkspaceState {
   phase: 'starting' | 'disconnected' | 'connecting' | 'connected' | 'disconnecting';
   session: Session | null;
+  lastConnection: Profile | null;
   profiles: Profile[];
   local: PaneState;
   remote: PaneState;
@@ -55,6 +56,7 @@ export function createWorkspace(client: Client, initialProfiles: Profile[] = loa
   let state: WorkspaceState = {
     phase: 'starting',
     session: null,
+    lastConnection: null,
     profiles: initialProfiles,
     local: pane(),
     remote: pane(),
@@ -65,6 +67,7 @@ export function createWorkspace(client: Client, initialProfiles: Profile[] = loa
   };
   const subscribers = new Set<() => void>();
   let epoch = 0;
+  let attempt: { id: Promise<string>; generation: number; cancelled: boolean } | null = null;
   let activeId: string | null = null;
   let meter: TransferMeter | null = null;
   let speedTimer: ReturnType<typeof setInterval> | undefined;
@@ -215,6 +218,12 @@ export function createWorkspace(client: Client, initialProfiles: Profile[] = loa
         update({
           session: { ...info, id: crypto.randomUUID(), name: saved?.name || info.host },
           phase: 'connected',
+          lastConnection: saved || {
+            ...info,
+            id: crypto.randomUUID(),
+            name: info.host,
+            timeoutSeconds: 30,
+          },
         });
         log(`Restored ${info.host}:${info.port}`);
       } else update({ phase: 'disconnected' });
@@ -259,6 +268,26 @@ export function createWorkspace(client: Client, initialProfiles: Profile[] = loa
         updateTransfer(id, { status: 'running' });
         update({ error: message(error) });
       }
+    }
+  }
+  async function beginConnection() {
+    if (!client.available)
+      throw new Error('Server connections are available in the desktop application.');
+    if (state.phase !== 'disconnected' || attempt)
+      throw new Error('Disconnect the current session first.');
+    const current = { id: client.beginConnectionAttempt(), generation: ++epoch, cancelled: false };
+    attempt = current;
+    update({ phase: 'connecting', error: '' });
+    try {
+      const id = await current.id;
+      if (attempt !== current || current.cancelled) throw new Error('Connection attempt aborted.');
+      return id;
+    } catch (error) {
+      if (attempt === current && !current.cancelled) {
+        attempt = null;
+        update({ phase: 'disconnected' });
+      }
+      throw error;
     }
   }
   return {
@@ -310,18 +339,57 @@ export function createWorkspace(client: Client, initialProfiles: Profile[] = loa
     },
     clearError: () => update({ error: '' }),
     clearLogs: () => update({ logs: [] }),
-    async connect(profile: Profile, password: string) {
-      if (!client.available)
-        throw new Error('Server connections are available in the desktop application.');
-      if (state.phase !== 'disconnected') throw new Error('Disconnect the current session first.');
+    beginConnection,
+    async endConnection(id: string) {
+      const current = attempt;
+      if (current && (await current.id) === id && attempt === current) {
+        attempt = null;
+        if (state.phase === 'connecting') update({ phase: 'disconnected' });
+      }
+      await client.endConnectionAttempt(id);
+    },
+    async abortConnection() {
+      const current = attempt;
+      if (!current) return;
+      current.cancelled = true;
       epoch++;
-      update({ phase: 'connecting', error: '' });
+      const id = await current.id.catch(() => null);
+      if (!id) {
+        if (attempt === current) {
+          attempt = null;
+          update({ phase: 'disconnected' });
+        }
+        return;
+      }
       try {
-        const result = await client.connect(profile, password);
+        await client.cancelConnectionAttempt(id);
+        await client.endConnectionAttempt(id);
+        if (attempt === current) {
+          attempt = null;
+          update({
+            phase: 'disconnected',
+            session: null,
+            remote: { ...pane(), revision: state.remote.revision + 1 },
+          });
+          log('Connection attempt aborted.');
+        }
+      } catch (error) {
+        update({ error: message(error) });
+        throw error;
+      }
+    },
+    async connect(profile: Profile, password: string, attemptId?: string) {
+      const id = attemptId ?? (await beginConnection());
+      const current = attempt;
+      if (!current || current.cancelled || (await current.id) !== id) return false;
+      try {
+        const result = await client.connect(profile, password, id);
+        if (attempt !== current || current.cancelled || current.generation !== epoch) return false;
         saveProfile(profile);
         update({
           phase: 'connected',
           session: { ...profileMetadata(profile), cwd: result.cwd, id: crypto.randomUUID() },
+          lastConnection: profileMetadata(profile),
           queue: [],
           paused: false,
         });
@@ -330,10 +398,18 @@ export function createWorkspace(client: Client, initialProfiles: Profile[] = loa
           browse('remote', result.cwd),
           profile.localPath ? browse('local', profile.localPath) : Promise.resolve(),
         ]);
+        return true;
       } catch (error) {
+        if (attempt !== current || current.cancelled || current.generation !== epoch) return false;
         update({ phase: 'disconnected' });
         log(message(error), 'error');
         throw error;
+      } finally {
+        // The UI owns attempts spanning host inspection, trust and authentication.
+        if (!attemptId) {
+          if (attempt === current) attempt = null;
+          await client.endConnectionAttempt(id);
+        }
       }
     },
     async disconnect() {

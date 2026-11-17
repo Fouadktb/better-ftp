@@ -327,3 +327,226 @@ fn rejects_untrusted_ftps_certificate() {
         .expect("Untrusted self-signed certificate must fail");
     assert!(error.contains("Secure connection failed"), "{error}");
 }
+
+#[test]
+fn aborts_stalled_ftp_and_ssh_handshakes_without_installing_a_session() {
+    use std::{
+        io::Read,
+        net::TcpListener,
+        sync::mpsc,
+        time::{Duration, Instant},
+    };
+    for protocol in [Protocol::Ftp, Protocol::Ftps, Protocol::Sftp] {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (accepted_tx, accepted_rx) = mpsc::channel();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(3)))
+                .unwrap();
+            accepted_tx.send(()).unwrap();
+            let mut bytes = [0; 512];
+            while matches!(stream.read(&mut bytes), Ok(n) if n > 0) {}
+        });
+        let session: Session = Default::default();
+        let id = begin_attempt(&session).unwrap();
+        assert!(begin_attempt(&session).is_err());
+        let token = attempt_token(&session, Some(&id)).unwrap();
+        let native = session.clone();
+        let old_id = id.clone();
+        let (done_tx, done_rx) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let result = connect_session_attempt(
+                native,
+                ConnectionInput {
+                    protocol: Some(protocol),
+                    timeout_seconds: Some(30),
+                    ..connection(port, false)
+                },
+                &token,
+                Some(old_id),
+            );
+            done_tx.send(token.result(result).map(|_| ())).unwrap();
+        });
+        accepted_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+        let started = Instant::now();
+        cancel_attempt(&session, &id).unwrap();
+        assert!(started.elapsed() < Duration::from_millis(500));
+        let retry_id = begin_attempt(&session).unwrap();
+        assert_ne!(id, retry_id);
+        assert!(attempt_token(&session, Some(&retry_id)).is_ok());
+        assert_eq!(
+            done_rx
+                .recv_timeout(Duration::from_secs(2))
+                .unwrap()
+                .unwrap_err(),
+            attempt::CANCELLED
+        );
+        assert!(session_info(&session).unwrap().is_none());
+        assert!(session.remote.lock().unwrap().is_none());
+        // A delayed abort for an old attempt must leave the new token usable.
+        cancel_attempt(&session, &id).unwrap();
+        assert!(attempt_token(&session, Some(&retry_id)).is_ok());
+        worker.join().unwrap();
+        server.join().unwrap();
+    }
+}
+
+#[test]
+fn aborts_stalled_ssh_host_inspection_without_trusting_any_key() {
+    use std::{io::Read, net::TcpListener, sync::mpsc, time::Duration};
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let (accepted_tx, accepted_rx) = mpsc::channel();
+    let server = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(3)))
+            .unwrap();
+        accepted_tx.send(()).unwrap();
+        let mut bytes = [0; 512];
+        while matches!(stream.read(&mut bytes), Ok(n) if n > 0) {}
+    });
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("known_hosts");
+    let session = Arc::new(SessionState::with_known_hosts(path.clone()));
+    let id = begin_attempt(&session).unwrap();
+    let token = attempt_token(&session, Some(&id)).unwrap();
+    let key_path = path.clone();
+    let (done_tx, done_rx) = mpsc::channel();
+    let worker = std::thread::spawn(move || {
+        let result = ssh::inspect_with_attempt(
+            ssh::HostInput {
+                host: "127.0.0.1".into(),
+                port,
+                timeout_seconds: Some(30),
+            },
+            &key_path,
+            &token,
+        );
+        done_tx.send(token.result(result).map(|_| ())).unwrap();
+    });
+    accepted_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+    cancel_attempt(&session, &id).unwrap();
+    assert_eq!(
+        done_rx
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap()
+            .unwrap_err(),
+        attempt::CANCELLED
+    );
+    assert!(!path.exists());
+    worker.join().unwrap();
+    server.join().unwrap();
+}
+
+#[test]
+#[ignore = "Requires BFTP_TEST_PYTHON with pyftpdlib; opens loopback ports"]
+fn abort_after_connect_success_clears_only_its_own_session() {
+    let remote = tempfile::tempdir().unwrap();
+    let (_fixture, port) = fixture(remote.path(), None);
+    let session: Session = Default::default();
+    let old_id = begin_attempt(&session).unwrap();
+    let token = attempt_token(&session, Some(&old_id)).unwrap();
+    connect_session_attempt(
+        session.clone(),
+        connection(port, false),
+        &token,
+        Some(old_id.clone()),
+    )
+    .unwrap();
+    assert!(session_info(&session).unwrap().is_some());
+    cancel_attempt(&session, &old_id).unwrap();
+    assert!(session_info(&session).unwrap().is_none());
+    let id = begin_attempt(&session).unwrap();
+    let token = attempt_token(&session, Some(&id)).unwrap();
+    connect_session_attempt(session.clone(), connection(port, false), &token, Some(id)).unwrap();
+    cancel_attempt(&session, &old_id).unwrap();
+    assert!(session_info(&session).unwrap().is_some());
+    assert!(list_remote_session(&session, "/").is_ok());
+    disconnect_session(session).unwrap();
+}
+
+#[test]
+fn aborts_tls_login_and_initial_directory_requests() {
+    use std::{
+        io::{BufRead, BufReader, Read, Write},
+        net::TcpListener,
+        sync::mpsc,
+        time::Duration,
+    };
+    for stage in ["tls", "password", "directory"] {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let server = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            socket
+                .set_read_timeout(Some(Duration::from_secs(3)))
+                .unwrap();
+            socket.write_all(b"220 Test server\r\n").unwrap();
+            let mut reader = BufReader::new(socket);
+            loop {
+                let mut command = String::new();
+                reader.read_line(&mut command).unwrap();
+                let command = command.split_whitespace().next().unwrap();
+                let response = match command {
+                    "AUTH" if stage == "tls" => {
+                        reader
+                            .get_mut()
+                            .write_all(b"234 Proceed with TLS\r\n")
+                            .unwrap();
+                        break;
+                    }
+                    "USER" => b"331 Password required\r\n".as_slice(),
+                    "PASS" if stage == "password" => break,
+                    "PASS" => b"230 Logged in\r\n".as_slice(),
+                    "TYPE" => b"200 Binary mode\r\n".as_slice(),
+                    "PWD" if stage == "directory" => break,
+                    _ => panic!("Unexpected fixture command: {command}"),
+                };
+                reader.get_mut().write_all(response).unwrap();
+            }
+            ready_tx.send(()).unwrap();
+            let mut bytes = [0; 1024];
+            while matches!(reader.read(&mut bytes), Ok(n) if n > 0) {}
+        });
+        let session: Session = Default::default();
+        let id = begin_attempt(&session).unwrap();
+        let token = attempt_token(&session, Some(&id)).unwrap();
+        let native = session.clone();
+        let old_id = id.clone();
+        let (done_tx, done_rx) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let result = connect_session_attempt(
+                native,
+                ConnectionInput {
+                    protocol: Some(if stage == "tls" {
+                        Protocol::Ftps
+                    } else {
+                        Protocol::Ftp
+                    }),
+                    timeout_seconds: Some(30),
+                    ..connection(port, false)
+                },
+                &token,
+                Some(old_id),
+            );
+            done_tx.send(token.result(result).map(|_| ())).unwrap();
+        });
+        ready_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+        cancel_attempt(&session, &id).unwrap();
+        assert_eq!(
+            done_rx
+                .recv_timeout(Duration::from_secs(2))
+                .unwrap()
+                .unwrap_err(),
+            attempt::CANCELLED
+        );
+        assert!(session_info(&session).unwrap().is_none());
+        assert!(session.remote.lock().unwrap().is_none());
+        worker.join().unwrap();
+        server.join().unwrap();
+    }
+}

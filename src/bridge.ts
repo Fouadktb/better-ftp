@@ -26,12 +26,15 @@ export interface TransferProgress {
 export interface Client {
   readonly available: boolean;
   getSession(): Promise<SessionInfo | null>;
-  inspectHost(profile: Profile): Promise<HostKeyInfo>;
-  trustHost(info: HostKeyInfo, timeoutSeconds: number): Promise<HostKeyInfo>;
+  beginConnectionAttempt(): Promise<string>;
+  cancelConnectionAttempt(id: string): Promise<void>;
+  endConnectionAttempt(id: string): Promise<void>;
+  inspectHost(profile: Profile, attemptId?: string): Promise<HostKeyInfo>;
+  trustHost(info: HostKeyInfo, timeoutSeconds: number, attemptId?: string): Promise<HostKeyInfo>;
   pickPath(kind: 'key' | 'directory'): Promise<string | null>;
   listLocal(path?: string): Promise<{ path: string; entries: FileEntry[] }>;
   listRemote(path: string): Promise<{ path: string; entries: FileEntry[] }>;
-  connect(profile: Profile, password: string): Promise<{ cwd: string }>;
+  connect(profile: Profile, password: string, attemptId?: string): Promise<{ cwd: string }>;
   disconnect(): Promise<void>;
   transfer(item: Transfer): Promise<void>;
   cancel(id: string): Promise<boolean>;
@@ -48,12 +51,17 @@ function desktop<T>(command: string, args?: Record<string, unknown>): Promise<T>
 export const client: Client = {
   available,
   getSession: () => (available ? desktop('get_session') : Promise.resolve(null)),
-  inspectHost: (profile) =>
+  beginConnectionAttempt: () => desktop('begin_connection_attempt'),
+  cancelConnectionAttempt: (id) => desktop('cancel_connection_attempt', { id }),
+  endConnectionAttempt: (id) => desktop('end_connection_attempt', { id }),
+  inspectHost: (profile, attemptId) =>
     desktop('inspect_ssh_host', {
+      attemptId: attemptId ?? null,
       input: { host: profile.host, port: profile.port, timeoutSeconds: profile.timeoutSeconds },
     }),
-  trustHost: (info, timeoutSeconds) =>
+  trustHost: (info, timeoutSeconds, attemptId) =>
     desktop('trust_ssh_host', {
+      attemptId: attemptId ?? null,
       input: { host: info.host, port: info.port, fingerprint: info.fingerprint, timeoutSeconds },
     }),
   pickPath: async (kind) => {
@@ -67,8 +75,9 @@ export const client: Client = {
   },
   listLocal: (path) => desktop('list_local', { path: path || null }),
   listRemote: (path) => desktop('list_remote', { path }),
-  connect: (profile, password) =>
+  connect: (profile, password, attemptId) =>
     desktop('connect_remote', {
+      attemptId: attemptId ?? null,
       input: {
         host: profile.host,
         port: profile.port,

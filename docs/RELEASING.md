@@ -4,7 +4,7 @@ Release preparation creates reviewable installers and a draft prerelease. Publis
 
 ## Current readiness
 
-The repository destination is [Fouadktb/better-ftp](https://github.com/Fouadktb/better-ftp), selected by the owner with the [MIT license](../LICENSE). The current draft prerelease version is `0.1.0-alpha.2`. The original `alpha.1` tag is preserved; `alpha.2` corrects GitHub asset filename normalization in the checksum manifest. Package, lockfile, Tauri, and Cargo versions are synchronized.
+The repository destination is [Fouadktb/better-ftp](https://github.com/Fouadktb/better-ftp), selected by the owner with the [MIT license](../LICENSE). The current prerelease version is `0.1.0-alpha.3`, adding connection abort and reconnect. The original `alpha.1` and `alpha.2` drafts/tags are preserved; `alpha.2` corrected GitHub asset filename normalization in the checksum manifest. Package, lockfile, Tauri, and Cargo versions are synchronized.
 
 Local alpha validation covers frontend tests/build and native macOS FTP/SFTP integration. GitHub installer builds and platform smoke results are recorded separately; creating a draft does not imply signing or production readiness.
 
@@ -52,7 +52,7 @@ Maintainer steps, once the owner authorizes the repository and release:
 3. Run the manual workflow with `create_draft` disabled to review build results before creating a tag.
 4. Create the matching annotated prerelease tag on the reviewed commit and push it. Tagging/pushing is an explicit release action, not part of local preparation.
 5. Inspect every installer and checksum, test clean installation on each target, and edit the draft notes to record actual validation and unsigned/notarized status.
-6. Publish the draft only when the owner authorizes publication and the remaining gates are satisfied. Retain the prerelease flag for alpha builds.
+6. Publish only with owner authorization after the checks and installer builds pass. Retain the prerelease flag for alpha builds and disclose outstanding platform smoke tests and signing limitations in the release notes; these remain requirements before a stable release.
 
 ## Signing and notarization
 

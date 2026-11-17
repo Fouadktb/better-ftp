@@ -13,7 +13,10 @@ import { Button, IconButton } from './ui/button';
 type Tab = 'connection' | 'directories' | 'advanced';
 export default function ConnectionDialog({
   profile,
+  reconnecting,
   busy,
+  aborting,
+  onAbort,
   error,
   connected,
   onClose,
@@ -23,7 +26,10 @@ export default function ConnectionDialog({
   onPickPath,
 }: {
   profile?: Profile;
+  reconnecting: boolean;
   busy: boolean;
+  aborting: boolean;
+  onAbort: () => void;
   error: string;
   connected: boolean;
   onClose: () => void;
@@ -141,6 +147,12 @@ export default function ConnectionDialog({
         <Dialog.Overlay className="dialog-overlay" />
         <Dialog.Content
           className="dialog-content connection-dialog"
+          onOpenAutoFocus={(event) => {
+            if (reconnecting && secretRef.current) {
+              event.preventDefault();
+              secretRef.current.focus();
+            }
+          }}
           onEscapeKeyDown={(event) => {
             event.preventDefault();
             if (discardOpen) setDiscardOpen(false);
@@ -160,7 +172,9 @@ export default function ConnectionDialog({
           }}
         >
           <div className="dialog-heading">
-            <Dialog.Title>{profile ? 'Edit connection' : 'New connection'}</Dialog.Title>
+            <Dialog.Title>
+              {reconnecting ? 'Reconnect' : profile ? 'Edit connection' : 'New connection'}
+            </Dialog.Title>
             <IconButton
               label="Close connection dialog"
               disabled={busy || picking}
@@ -398,6 +412,12 @@ export default function ConnectionDialog({
               <span>Only connection settings are stored on this device.</span>
             </div>
             <div className="dialog-actions">
+              {busy && (
+                <Button disabled={aborting} onClick={onAbort}>
+                  <XMarkIcon />
+                  {aborting ? 'Aborting…' : 'Abort connection'}
+                </Button>
+              )}
               {profile && (
                 <Button
                   variant="danger"
@@ -419,7 +439,7 @@ export default function ConnectionDialog({
               </Button>
               <Button type="submit" variant="primary" disabled={busy || picking || connected}>
                 {busy && <ArrowPathIcon className="spinning" />}
-                {busy ? 'Connecting…' : 'Connect'}
+                {busy ? 'Connecting…' : reconnecting ? 'Reconnect' : 'Connect'}
               </Button>
             </div>
           </form>

@@ -46,16 +46,24 @@ export default function App() {
   const [transferView, setTransferView] = useState<TransferView>('queue');
   const [hidden, setHidden] = useState(false);
   const [activePane, setActivePane] = useState<Side>('local');
-  const [dialog, setDialog] = useState<{ profile?: Profile } | null>(null);
+  const [dialog, setDialog] = useState<{ profile?: Profile; reconnecting?: boolean } | null>(null);
   const [connectError, setConnectError] = useState('');
   const [checkingHost, setCheckingHost] = useState(false);
   const [hostKey, setHostKey] = useState<HostKeyInfo | null>(null);
   const [trusting, setTrusting] = useState(false);
+  const [aborting, setAborting] = useState(false);
+  const connectionRun = useRef(0);
   const [hostKeyError, setHostKeyError] = useState('');
-  const pendingConnection = useRef<{ profile: Profile; password: string } | null>(null);
+  const pendingConnection = useRef<{
+    profile: Profile;
+    password: string;
+    attemptId: string;
+    run: number;
+  } | null>(null);
   const [shortcuts, setShortcuts] = useState(false);
   const busy = workspace.busy();
   const operating =
+    aborting ||
     checkingHost ||
     hostKey !== null ||
     ['starting', 'connecting', 'disconnecting'].includes(state.phase);
@@ -90,34 +98,42 @@ export default function App() {
     return () => window.removeEventListener('keydown', key);
   }, [state.phase, small]);
   const errorText = (error: unknown) => (error instanceof Error ? error.message : String(error));
-  async function finishConnect(profile: Profile, password: string) {
+  async function finishConnect(profile: Profile, password: string, attemptId: string, run: number) {
     try {
-      await workspace.connect(profile, password);
-      setDialog(null);
+      const connected = await workspace.connect(profile, password, attemptId);
+      if (run === connectionRun.current && connected) setDialog(null);
     } catch (error) {
-      setConnectError(errorText(error));
+      if (run === connectionRun.current) setConnectError(errorText(error));
+    } finally {
+      await workspace.endConnection(attemptId).catch(() => {});
     }
   }
   async function connect(profile: Profile, password: string) {
+    const run = ++connectionRun.current;
+    let attemptId: string | undefined;
     setConnectError('');
-    if (profile.protocol === 'sftp') {
-      setCheckingHost(true);
-      try {
-        const info = await client.inspectHost(profile);
+    setCheckingHost(true);
+    try {
+      attemptId = await workspace.beginConnection();
+      if (run !== connectionRun.current) return;
+      if (profile.protocol === 'sftp') {
+        const info = await client.inspectHost(profile, attemptId);
+        if (run !== connectionRun.current) return;
         if (info.status !== 'trusted') {
-          pendingConnection.current = { profile, password };
+          pendingConnection.current = { profile, password, attemptId, run };
           setHostKey(info);
           setHostKeyError('');
           return;
         }
-      } catch (error) {
-        setConnectError(errorText(error));
-        return;
-      } finally {
-        setCheckingHost(false);
       }
+      setCheckingHost(false);
+      await finishConnect(profile, password, attemptId, run);
+    } catch (error) {
+      if (run === connectionRun.current) setConnectError(errorText(error));
+      if (attemptId) await workspace.endConnection(attemptId).catch(() => {});
+    } finally {
+      if (run === connectionRun.current) setCheckingHost(false);
     }
-    await finishConnect(profile, password);
   }
   async function trustAndConnect() {
     const pending = pendingConnection.current;
@@ -125,21 +141,45 @@ export default function App() {
     setTrusting(true);
     setHostKeyError('');
     try {
-      await client.trustHost(hostKey, pending.profile.timeoutSeconds);
+      await client.trustHost(hostKey, pending.profile.timeoutSeconds, pending.attemptId);
+      if (pending.run !== connectionRun.current) return;
       pendingConnection.current = null;
       setHostKey(null);
-      await finishConnect(pending.profile, pending.password);
-    } catch (error) {
-      setHostKeyError(errorText(error));
-    } finally {
       setTrusting(false);
+      await finishConnect(pending.profile, pending.password, pending.attemptId, pending.run);
+    } catch (error) {
+      if (pending.run === connectionRun.current) setHostKeyError(errorText(error));
+    } finally {
+      if (pending.run === connectionRun.current) setTrusting(false);
     }
   }
-  function cancelHostTrust() {
-    if (trusting) return;
+  async function abortConnection() {
+    connectionRun.current++;
     pendingConnection.current = null;
     setHostKey(null);
     setHostKeyError('');
+    setCheckingHost(false);
+    setTrusting(false);
+    setAborting(true);
+    try {
+      await workspace.abortConnection();
+      setConnectError('');
+    } catch (error) {
+      setConnectError(errorText(error));
+    } finally {
+      setAborting(false);
+    }
+  }
+  async function reconnect() {
+    const profile = state.lastConnection;
+    if (!profile || busy || operating) return;
+    try {
+      if (state.session) await workspace.disconnect();
+      setConnectError('');
+      setDialog({ profile, reconnecting: true });
+    } catch {
+      /* The workspace displays disconnect failures. */
+    }
   }
   const completed = state.queue.filter((t) => t.status === 'completed');
   const pending = state.queue.filter((t) => ['queued', 'running', 'cancelling'].includes(t.status));
@@ -245,20 +285,35 @@ export default function App() {
                 >
                   <Bars3Icon />
                 </IconButton>
-                <div className="session-tab">
+                <div className={`session-tab ${state.session ? 'connected' : ''}`}>
                   <ServerIcon />
                   <span>{state.session?.name || 'No connection'}</span>
-                  {state.session && (
-                    <IconButton
-                      label="Disconnect"
-                      disabled={busy || operating}
-                      onClick={() => void workspace.disconnect().catch(() => {})}
-                    >
-                      <XMarkIcon />
-                    </IconButton>
-                  )}
                 </div>
                 <div className="toolbar-spacer" />
+                {state.session && (
+                  <Button
+                    className="session-action"
+                    disabled={busy || operating}
+                    onClick={() => void workspace.disconnect().catch(() => {})}
+                    aria-label="Disconnect"
+                    title={busy ? 'Finish or cancel transfers before disconnecting' : undefined}
+                  >
+                    <XMarkIcon />
+                    <span>Disconnect</span>
+                  </Button>
+                )}
+                {state.lastConnection && (
+                  <Button
+                    className="session-action"
+                    disabled={busy || operating}
+                    onClick={() => void reconnect()}
+                    aria-label="Reconnect"
+                    title={busy ? 'Finish or cancel transfers before reconnecting' : undefined}
+                  >
+                    <ArrowPathIcon />
+                    <span>Reconnect</span>
+                  </Button>
+                )}
                 {!state.session && (
                   <Button
                     variant="primary"
@@ -422,9 +477,12 @@ export default function App() {
           <ConnectionDialog
             key={dialog.profile?.id || 'new'}
             profile={dialog.profile}
+            reconnecting={!!dialog.reconnecting}
             onPickPath={workspace.pickPath}
             connected={!!state.session}
-            busy={state.phase === 'connecting' || checkingHost || hostKey !== null}
+            busy={state.phase === 'connecting' || checkingHost || hostKey !== null || aborting}
+            aborting={aborting}
+            onAbort={() => void abortConnection()}
             error={connectError}
             onClose={() => setDialog(null)}
             onConnect={(p, password) => void connect(p, password)}
@@ -442,7 +500,7 @@ export default function App() {
             info={hostKey}
             busy={trusting}
             error={hostKeyError}
-            onCancel={cancelHostTrust}
+            onCancel={() => void abortConnection()}
             onTrust={() => void trustAndConnect()}
           />
         )}

@@ -451,19 +451,8 @@ a {
   text-overflow: ellipsis;
   white-space: nowrap;
 }
-.session-tab:has(button) {
+.session-tab.connected {
   color: var(--foreground);
-}
-.session-tab > .icon-button {
-  width: 22px;
-  height: 24px;
-  min-height: 24px;
-  padding: 3px;
-  margin-left: 6px;
-}
-.session-tab > .icon-button svg {
-  width: 12px;
-  height: 12px;
 }
 .toolbar-spacer {
   flex: 1;
@@ -1560,5 +1549,16 @@ tr[data-selected='true'] .file-name {
   }
   .host-key-details {
     font-size: 14px;
+  }
+}
+
+@media (max-width: 760px) {
+  .session-action {
+    width: 30px;
+    padding: 0;
+    flex-shrink: 0;
+  }
+  .session-action span {
+    display: none;
   }
 }

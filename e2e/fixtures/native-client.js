@@ -37,9 +37,26 @@ let session = null;
 let active = null;
 const handlers = new Set();
 let cancelled = false;
+const attempts = new Map();
 export const client = {
   available: true,
-  async inspectHost(profile) {
+  async beginConnectionAttempt() {
+    const id = crypto.randomUUID();
+    attempts.set(id, false);
+    return id;
+  },
+  async cancelConnectionAttempt(id) {
+    attempts.set(id, true);
+    session = null;
+  },
+  async endConnectionAttempt(id) {
+    attempts.delete(id);
+  },
+  async inspectHost(profile, attemptId) {
+    if (profile.host === 'slow.example.test') {
+      await new Promise((resolve) => setTimeout(resolve, 1500));
+      if (attempts.get(attemptId) !== false) throw new Error('Connection attempt aborted.');
+    }
     return {
       host: profile.host,
       port: profile.port,
@@ -73,7 +90,11 @@ export const client = {
     session.cwd = path;
     return { path, entries: [...remote[path]] };
   },
-  async connect(profile, password) {
+  async connect(profile, password, attemptId) {
+    if (password === 'slow') {
+      await new Promise((resolve) => setTimeout(resolve, 1500));
+      if (attempts.get(attemptId) !== false) throw new Error('Connection attempt aborted.');
+    }
     if (password === 'bad') throw new Error('Login failed.');
     session = {
       host: profile.host,

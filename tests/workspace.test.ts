@@ -34,6 +34,11 @@ function fixture(connected = true) {
   let progress: (e: TransferProgress) => void = () => {};
   const client: Client = {
     available: true,
+    beginConnectionAttempt: vi.fn(async () => crypto.randomUUID()),
+    cancelConnectionAttempt: vi.fn(async () => {
+      session = null;
+    }),
+    endConnectionAttempt: vi.fn(async () => {}),
     getSession: vi.fn(async () => session),
     inspectHost: vi.fn(async (p) => ({
       host: p.host,
@@ -337,4 +342,105 @@ it('updates active throughput and reports zero after stalled progress', async ()
     store.dispose();
     vi.useRealTimers();
   }
+});
+
+describe('connection attempt cancellation', () => {
+  it('does not restore an aborted connection when an old native reply arrives', async () => {
+    const { client } = fixture(false);
+    const old = deferred<{ cwd: string }>();
+    vi.mocked(client.connect).mockReturnValueOnce(old.promise);
+    const store = createWorkspace(client, []);
+    await store.start();
+    const connecting = store.connect(profile, 'secret');
+    await settle();
+    expect(store.getSnapshot().phase).toBe('connecting');
+    await store.abortConnection();
+    expect(store.getSnapshot().phase).toBe('disconnected');
+    const other = { ...profile, id: 'server-b', host: 'b.test' };
+    await store.connect(other, 'new-secret');
+    old.resolve({ cwd: '/stale' });
+    expect(await connecting).toBe(false);
+    expect(store.getSnapshot().session?.host).toBe('b.test');
+    expect(store.getSnapshot().remote.path).toBe('/remote');
+    expect(client.cancelConnectionAttempt).toHaveBeenCalledOnce();
+  });
+  it('can abort while native attempt registration is still pending', async () => {
+    const { client } = fixture(false);
+    const registration = deferred<string>();
+    vi.mocked(client.beginConnectionAttempt).mockReturnValueOnce(registration.promise);
+    const store = createWorkspace(client, []);
+    await store.start();
+    const starting = store.beginConnection().catch(() => {});
+    const aborting = store.abortConnection();
+    registration.resolve('pending-attempt');
+    await Promise.all([starting, aborting]);
+    expect(client.cancelConnectionAttempt).toHaveBeenCalledWith('pending-attempt');
+    expect(store.getSnapshot().phase).toBe('disconnected');
+    expect(client.connect).not.toHaveBeenCalled();
+  });
+  it('preserves the last successful settings through disconnect without retaining secrets', async () => {
+    const { client } = fixture(false);
+    const store = createWorkspace(client, []);
+    await store.start();
+    const configured = {
+      ...profile,
+      privateKeyPath: '/key',
+      localPath: '/local',
+      remotePath: '/remote',
+      timeoutSeconds: 12,
+    };
+    await store.connect(configured, 'never-retained');
+    await store.disconnect();
+    expect(store.getSnapshot().lastConnection).toMatchObject({
+      host: profile.host,
+      timeoutSeconds: 12,
+      localPath: '/local',
+      remotePath: '/remote',
+    });
+    expect(JSON.stringify(store.getSnapshot())).not.toContain('never-retained');
+  });
+  it('does not abort or disconnect a connected session when no attempt is active', async () => {
+    const { client } = fixture(false);
+    const store = createWorkspace(client, []);
+    await store.start();
+    await store.connect(profile, 'secret');
+    await store.abortConnection();
+    expect(store.getSnapshot().phase).toBe('connected');
+    expect(client.cancelConnectionAttempt).not.toHaveBeenCalled();
+  });
+});
+
+it('returns to disconnected if native registration fails during abort', async () => {
+  const { client } = fixture(false);
+  const registration = deferred<string>();
+  vi.mocked(client.beginConnectionAttempt).mockReturnValueOnce(registration.promise);
+  const store = createWorkspace(client, []);
+  await store.start();
+  const starting = store.beginConnection().catch(() => {});
+  const aborting = store.abortConnection();
+  registration.reject(new Error('Registration failed.'));
+  await Promise.all([starting, aborting]);
+  expect(store.getSnapshot().phase).toBe('disconnected');
+  await store.connect(profile, 'retry');
+  expect(store.getSnapshot().phase).toBe('connected');
+});
+
+it('ending an aborted UI attempt cannot reset a newer connection attempt', async () => {
+  const { client } = fixture(false);
+  const store = createWorkspace(client, []);
+  await store.start();
+  const old = deferred<{ cwd: string }>();
+  vi.mocked(client.connect).mockReturnValueOnce(old.promise);
+  const firstId = await store.beginConnection();
+  const first = store.connect(profile, 'old', firstId);
+  await settle();
+  await store.abortConnection();
+  const nextId = await store.beginConnection();
+  old.resolve({ cwd: '/old' });
+  await first;
+  await store.endConnection(firstId);
+  expect(store.getSnapshot().phase).toBe('connecting');
+  expect(await store.connect({ ...profile, host: 'next.test' }, 'new', nextId)).toBe(true);
+  await store.endConnection(nextId);
+  expect(store.getSnapshot().session?.host).toBe('next.test');
 });

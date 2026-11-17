@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+## 0.1.0-alpha.3 — 2026-11-17
+
+### Added
+
+- Abort an in-progress FTP, FTPS or SFTP connection, including SSH host inspection and verification. Form edits remain available for retry.
+- Visible Disconnect and Reconnect controls. Reconnect restores the last server settings and requests a fresh password or key passphrase; transfer work must finish or be cancelled first.
+
+### Fixed
+
+- Cancel native connection sockets and reject late responses so an aborted connection cannot replace a newer session.
+
 ## 0.1.0-alpha.2 — 2026-11-16
 
 ### Fixed
